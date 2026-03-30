@@ -1,0 +1,573 @@
+# AI 위험 필터 프로그램
+
+# vscode 기준으로 제작됨
+# pip install transformers torch torchvision torchaudio   (필수 설치)
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118      (권장 설치)
+
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext
+import json
+from datetime import datetime
+import os
+from typing import Dict, Tuple, List
+import threading
+import torch
+from transformers import pipeline
+import numpy as np
+import re
+
+class AIRiskFilterAdvanced:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("AI 위험 필터 프로그램")
+        self.root.geometry("950x1150")
+        self.root.configure(bg="#f5f5f5")
+        
+        # 분석 결과 저장
+        self.analysis_result = None
+        self.current_text = ""
+        self.feedback_data = []
+        self.feedback_file = "feedback_log.json"
+        
+        # AI 모델 상태
+        self.models_loaded = False
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # 피드백 데이터 로드
+        self.load_feedback_data()
+        
+        self.setup_ui()
+        
+        # 백그라운드에서 모델 로드
+        threading.Thread(target=self.load_models, daemon=True).start()
+    
+    def setup_ui(self):
+        """UI 구성"""
+        # 제목
+        title_frame = ttk.Frame(self.root)
+        title_frame.pack(pady=15, padx=15, fill="x")
+        
+        title_label = ttk.Label(title_frame, text="AI 위험 필터 프로그램", 
+                               font=("Arial", 20, "bold"))
+        title_label.pack()
+        
+        # 개인정보 보호 안내
+        notice_label = ttk.Label(title_frame, 
+                                text="개인정보 보호: 입력된 텍스트는 판단 후 저장되지 않으며, 분석에만 사용됩니다.",
+                                font=("Arial", 9), foreground="gray")
+        notice_label.pack()
+        
+        # 모델 로딩 상태
+        self.status_label = ttk.Label(title_frame, text="AI 모델 로딩 중...", 
+                                     font=("Arial", 9, "bold"), foreground="orange")
+        self.status_label.pack()
+        
+        # 텍스트 입력 영역
+        input_frame = ttk.LabelFrame(self.root, text="분석할 텍스트 입력", padding=10)
+        input_frame.pack(pady=10, padx=15, fill="both", expand=True)
+        
+        self.text_input = scrolledtext.ScrolledText(input_frame, height=10, width=90, 
+                                                    wrap=tk.WORD, font=("Arial", 10))
+        self.text_input.pack(fill="both", expand=True)
+        
+        # 분석 버튼
+        button_frame1 = ttk.Frame(self.root)
+        button_frame1.pack(pady=10, padx=15, fill="x")
+        
+        self.analyze_btn = ttk.Button(button_frame1, text="분석하기", 
+                                     command=self.analyze_text_async, state="disabled")
+        self.analyze_btn.pack(side="left", padx=5)
+        
+        clear_btn = ttk.Button(button_frame1, text="초기화", command=self.clear_text)
+        clear_btn.pack(side="left", padx=5)
+        
+        # 분석 결과 영역
+        result_frame = ttk.LabelFrame(self.root, text="분석 결과", padding=10)
+        result_frame.pack(pady=10, padx=15, fill="x")
+        
+        self.result_labels = {}
+        categories = ["인종 차별", "성별 차별", "개인정보 노출", "취약계층 차별"]
+        category_keys = ["race", "gender", "privacy", "vulnerable"]
+        
+        self.category_keys = category_keys
+        
+        for i, (category, key) in enumerate(zip(categories, category_keys)):
+            row_frame = ttk.Frame(result_frame)
+            row_frame.pack(fill="x", pady=5)
+            
+            label = ttk.Label(row_frame, text=f"{category}:", font=("Arial", 10, "bold"), width=15)
+            label.pack(side="left", padx=5)
+            
+            self.result_labels[key] = {
+                "risk": ttk.Label(row_frame, text="검사 대기 중", 
+                                 font=("Arial", 9), foreground="gray"),
+                "confidence": ttk.Label(row_frame, text="", font=("Arial", 8), foreground="gray")
+            }
+            self.result_labels[key]["risk"].pack(side="left", padx=5)
+            self.result_labels[key]["confidence"].pack(side="left", padx=5)
+        
+        # 판단 과정 버튼
+        button_frame2 = ttk.Frame(self.root)
+        button_frame2.pack(pady=10, padx=15, fill="x")
+        
+        self.process_btn = ttk.Button(button_frame2, text="판단 과정 보기", 
+                                     command=self.show_process, state="disabled")
+        self.process_btn.pack(side="left", padx=5)
+        
+        # 피드백 영역
+        feedback_frame = ttk.LabelFrame(self.root, text="피드백 (분석 후 사용 가능)", padding=10)
+        feedback_frame.pack(pady=10, padx=15, fill="x")
+        
+        self.feedback_text = tk.Text(feedback_frame, height=3, width=90, font=("Arial", 9))
+        self.feedback_text.pack(fill="x", pady=5)
+        
+        feedback_btn_frame = ttk.Frame(feedback_frame)
+        feedback_btn_frame.pack(fill="x", pady=5)
+        
+        self.feedback_submit_btn = ttk.Button(feedback_btn_frame, text="피드백 제출", 
+                                             command=self.submit_feedback, state="disabled")
+        self.feedback_submit_btn.pack(side="left", padx=5)
+        
+        feedback_view_btn = ttk.Button(feedback_btn_frame, text="피드백 기록 보기", 
+                                       command=self.view_feedback_history)
+        feedback_view_btn.pack(side="left", padx=5)
+    
+    def load_models(self):
+        """AI 모델 로드"""
+        try:
+            self.status_label.config(text="AI 모델 로딩 중... (약 30-60초 소요)", foreground="orange")
+            self.root.update()
+            
+            print("모델 로딩 시작...")
+            
+            # Zero-shot 분류 (더 정확한 카테고리 분류)
+            self.zero_shot_classifier = pipeline(
+                "zero-shot-classification",
+                model="facebook/bart-large-mnli",
+                device=0 if torch.cuda.is_available() else -1
+            )
+            
+            self.models_loaded = True
+            self.status_label.config(text="AI 모델 준비 완료 ✓", foreground="green")
+            self.analyze_btn.config(state="normal")
+            print("모델 로드 완료")
+            
+        except Exception as e:
+            self.status_label.config(text=f"모델 로드 실패: {str(e)}", foreground="red")
+            print(f"모델 로드 오류: {str(e)}")
+    
+    def split_into_sentences(self, text: str) -> List[str]:
+        """텍스트를 문장 단위로 분할"""
+        # 다양한 문장 구분자로 분할
+        sentences = re.split(r'(?<=[.!?。！？\n])\s+|(?<=\n)\s*', text)
+        sentences = [s.strip() for s in sentences if s.strip() and len(s.strip()) > 1]
+        return sentences
+    
+    def analyze_text_async(self):
+        """비동기 텍스트 분석"""
+        if not self.models_loaded:
+            messagebox.showwarning("경고", "AI 모델이 아직 로딩 중입니다. 잠시만 기다려주세요.")
+            return
+        
+        # 별도 스레드에서 분석 수행
+        threading.Thread(target=self.analyze_text, daemon=True).start()
+    
+    def analyze_text(self):
+        """텍스트 분석 (메인 분석 함수)"""
+        self.current_text = self.text_input.get("1.0", tk.END).strip()
+        
+        if not self.current_text:
+            messagebox.showwarning("경고", "분석할 텍스트를 입력해주세요.")
+            return
+        
+        try:
+            self.status_label.config(text="분석 중...", foreground="orange")
+            self.root.update()
+            
+            # 텍스트를 문장 단위로 분할
+            sentences = self.split_into_sentences(self.current_text)
+            print(f"텍스트가 {len(sentences)}개의 문장으로 분할되었습니다.")
+            
+            # 분석 수행
+            self.analysis_result = {
+                "timestamp": datetime.now().isoformat(),
+                "text_length": len(self.current_text),
+                "sentences_count": len(sentences),
+                "results": {}
+            }
+            
+            # 각 카테고리별 분석
+            categories = {
+                "race": "인종 차별 표현 (특정 인종을 비하하거나 불이익을 암시하는 표현)",
+                "gender": "성별 차별 표현 (근거없는 성별 고정관념 및 차별)",
+                "privacy": "개인정보 노출 (민감한 개인정보 포함)",
+                "vulnerable": "취약계층 차별 (장애인, 고령자, 저소득층 혐오)"
+            }
+            
+            for key, description in categories.items():
+                risk_level, confidence, explanation, sentence_results = self.analyze_category_sentence_level(
+                    sentences, description, key
+                )
+                self.analysis_result["results"][key] = {
+                    "risk_level": risk_level,
+                    "confidence": confidence,
+                    "explanation": explanation,
+                    "sentence_results": sentence_results
+                }
+                self.update_result_display(key, risk_level, confidence)
+            
+            self.process_btn.config(state="normal")
+            self.feedback_submit_btn.config(state="normal")
+            self.status_label.config(text="분석 완료 ✓", foreground="green")
+            
+            messagebox.showinfo("완료", "분석이 완료되었습니다.")
+            
+        except Exception as e:
+            self.status_label.config(text=f"분석 오류: {str(e)}", foreground="red")
+            messagebox.showerror("오류", f"분석 중 오류 발생: {str(e)}")
+    
+    def analyze_category_sentence_level(self, sentences: List[str], category_description: str, 
+                                        category_key: str) -> Tuple[str, int, str, List]:
+        """문장 단위로 카테고리 분석"""
+        try:
+            risky_sentences = []
+            confidence_scores = []
+            risk_levels_found = {"위험": 0, "경고": 0, "주의": 0, "안전": 0}
+            sentence_results = []
+            
+            candidate_labels = [
+                f"{category_description}",
+                "안전한 표현 (위험 요소 없음)"
+            ]
+            
+            # 각 문장별로 분석
+            for sentence_idx, sentence in enumerate(sentences):
+                if not sentence.strip() or len(sentence.strip()) < 2:
+                    continue
+                
+                try:
+                    # 각 문장 분석
+                    result = self.zero_shot_classifier(
+                        sentence, 
+                        candidate_labels, 
+                        multi_class=False
+                    )
+                    
+                    top_label = result['labels'][0]
+                    confidence = int(result['scores'][0] * 100)
+                    confidence_scores.append(confidence)
+                    
+                    # 더 엄격한 위험도 기준
+                    if confidence > 80 and "차별" in top_label:
+                        sentence_risk_level = "위험"
+                    elif confidence > 65 and "차별" in top_label:
+                        sentence_risk_level = "경고"
+                    elif confidence > 50 and "차별" in top_label:
+                        sentence_risk_level = "주의"
+                    else:
+                        sentence_risk_level = "안전"
+                    
+                    risk_levels_found[sentence_risk_level] += 1
+                    
+                    # 위험한 문장 저장
+                    if sentence_risk_level != "안전":
+                        risky_sentences.append(sentence)
+                        sentence_results.append({
+                            "sentence": sentence,
+                            "risk_level": sentence_risk_level,
+                            "confidence": confidence,
+                            "index": sentence_idx
+                        })
+                    
+                except Exception as e:
+                    print(f"문장 {sentence_idx} 분석 오류: {str(e)}")
+                    continue
+            
+            # 최종 위험도 결정 (문장 단위 분석 결과 종합)
+            if risk_levels_found["위험"] > 0:
+                final_risk_level = "위험"
+            elif risk_levels_found["경고"] > 0:
+                final_risk_level = "경고"
+            elif risk_levels_found["주의"] > 0:
+                final_risk_level = "주의"
+            else:
+                final_risk_level = "안전"
+            
+            # 최종 신뢰도 (위험한 문장들의 평균 신뢰도)
+            if sentence_results:
+                dangerous_confidences = [s["confidence"] for s in sentence_results]
+                final_confidence = int(np.mean(dangerous_confidences))
+            else:
+                final_confidence = 0
+            
+            # 설명 생성
+            explanation = self.generate_category_explanation_sentence_level(
+                risky_sentences, category_key, final_risk_level, final_confidence, 
+                len(sentences), risk_levels_found, sentence_results
+            )
+            
+            return final_risk_level, final_confidence, explanation, sentence_results
+            
+        except Exception as e:
+            print(f"카테고리 분석 오류 ({category_key}): {str(e)}")
+            return "분석 실패", 0, f"오류: {str(e)}", []
+    
+    def generate_category_explanation_sentence_level(self, risky_sentences: List[str], category_key: str, 
+                                                    risk_level: str, confidence: int, 
+                                                    total_sentences: int, risk_levels_found: Dict,
+                                                    sentence_results: List) -> str:
+        """카테고리별 설명 생성 (문장 단위 분석)"""
+        
+        explanation = ""
+        
+        # 발견된 위험한 문장 표시
+        if risk_level != "안전" and sentence_results:
+            explanation += "⚠️ 발견된 위험한 문장:\n"
+            # 신뢰도 순으로 정렬 후 상위 5개만 표시
+            sorted_results = sorted(sentence_results, key=lambda x: x['confidence'], reverse=True)[:5]
+            for i, result in enumerate(sorted_results, 1):
+                risk_badge = "🔴 위험" if result['risk_level'] == "위험" else \
+                            "🟠 경고" if result['risk_level'] == "경고" else "🟡 주의"
+                explanation += f"  {i}. {risk_badge} ({result['confidence']}%) \"{result['sentence']}\"\n"
+            explanation += "\n"
+        elif risk_level != "안전":
+            explanation += "⚠️ 위험한 표현이 감지되었으나 구체적인 부분 식별 불가\n\n"
+        
+        explanation += f"판단 결과: {risk_level} (신뢰도: {confidence}%)\n\n"
+        explanation += f"문장별 분석 결과:\n"
+        explanation += f"  • 전체 문장 수: {total_sentences}개\n"
+        explanation += f"  • 🔴 위험한 문장: {risk_levels_found['위험']}개\n"
+        explanation += f"  • 🟠 경고 수준 문장: {risk_levels_found['경고']}개\n"
+        explanation += f"  • 🟡 주의 수준 문장: {risk_levels_found['주의']}개\n"
+        explanation += f"  • ✅ 안전한 문장: {risk_levels_found['안전']}개\n\n"
+        
+        # 카테고리별 추가 설명
+        explanations = {
+            "race": "이 텍스트는 특정 인종을 비하하거나 차별하는 표현을 포함할 가능성이 있습니다.",
+            "gender": "이 텍스트는 특정 성별에 대한 고정관념이나 차별 표현을 포함할 가능성이 있습니다.",
+            "privacy": "이 텍스트는 전화번호, 이메일, 개인 신상정보 등 민감한 개인정보를 포함할 수 있습니다.",
+            "vulnerable": "이 텍스트는 장애인, 고령자, 저소득층 등 취약계층을 대상으로 한 혐오 표현을 포함할 수 있습니다."
+        }
+        
+        if risk_level != "안전":
+            explanation += f"주의: {explanations.get(category_key, '위험한 표현이 감지되었습니다.')}"
+        
+        return explanation
+    
+    def update_result_display(self, category_key: str, risk_level: str, confidence: int):
+        """결과 표시 업데이트"""
+        color_map = {
+            "안전": "green",
+            "주의": "orange",
+            "경고": "red",
+            "위험": "darkred",
+            "분석 실패": "gray"
+        }
+        
+        label = self.result_labels[category_key]["risk"]
+        label.config(text=risk_level, foreground=color_map.get(risk_level, "black"))
+        
+        conf_label = self.result_labels[category_key]["confidence"]
+        conf_label.config(text=f"({confidence}%)")
+    
+    def show_process(self):
+        """판단 과정 표시"""
+        if not self.analysis_result:
+            messagebox.showwarning("경고", "먼저 텍스트를 분석해주세요.")
+            return
+        
+        # 새 윈도우 생성
+        process_window = tk.Toplevel(self.root)
+        process_window.title("판단 과정 설명")
+        process_window.geometry("900x750")
+        process_window.configure(bg="#f5f5f5")
+        
+        # 제목
+        title = ttk.Label(process_window, text="🤖 AI 판단 과정 상세 분석", 
+                         font=("Arial", 14, "bold"))
+        title.pack(pady=10)
+        
+        # 스크롤 텍스트 영역
+        text_frame = ttk.Frame(process_window)
+        text_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        process_text = scrolledtext.ScrolledText(text_frame, height=28, width=105, 
+                                                wrap=tk.WORD, font=("Courier", 8.5))
+        process_text.pack(fill="both", expand=True)
+        
+        # 분석 결과 텍스트 생성
+        explanation = self.generate_detailed_explanation()
+        process_text.insert("1.0", explanation)
+        process_text.config(state="disabled")
+        
+        # 닫기 버튼
+        close_btn = ttk.Button(process_window, text="닫기", command=process_window.destroy)
+        close_btn.pack(pady=10)
+    
+    def generate_detailed_explanation(self) -> str:
+        """상세 판단 과정 설명 생성"""
+        explanation = "=" * 100 + "\n"
+        explanation += "                         🤖 AI 판단 과정 상세 분석 (문장 단위)\n"
+        explanation += "=" * 100 + "\n\n"
+        
+        explanation += f"분석 시간: {self.analysis_result['timestamp']}\n"
+        explanation += f"입력 텍스트 길이: {self.analysis_result['text_length']} 자\n"
+        explanation += f"분석된 문장 수: {self.analysis_result['sentences_count']}개\n\n"
+        explanation += "=" * 100 + "\n\n"
+        
+        category_names = {
+            "race": "【인종 차별 표현 분석】",
+            "gender": "【성별 차별 표현 분석】",
+            "privacy": "【개인정보 노출 분석】",
+            "vulnerable": "【취약계층 차별 표현 분석】"
+        }
+        
+        for category_key, category_name in category_names.items():
+            result = self.analysis_result["results"][category_key]
+            
+            explanation += f"{category_name}\n"
+            explanation += f"최종 위험 수준: {result['risk_level']}\n"
+            explanation += f"신뢰도: {result['confidence']}%\n\n"
+            
+            explanation += "분석 상세:\n"
+            explanation += result['explanation'] + "\n\n"
+            
+            # 문장별 세부 분석 결과
+            if result['sentence_results']:
+                explanation += "문장별 상세 분석:\n"
+                sorted_results = sorted(result['sentence_results'], 
+                                      key=lambda x: x['confidence'], reverse=True)[:10]
+                for idx, sent_result in enumerate(sorted_results, 1):
+                    risk_emoji = "🔴" if sent_result['risk_level'] == "위험" else \
+                                "🟠" if sent_result['risk_level'] == "경고" else "🟡"
+                    explanation += f"  {idx}. {risk_emoji} [{sent_result['risk_level']}] "
+                    explanation += f"({sent_result['confidence']}%) \n"
+                    explanation += f"      \"{sent_result['sentence']}\"\n"
+                explanation += "\n"
+            
+            explanation += "-" * 100 + "\n\n"
+        
+        explanation += "=" * 100 + "\n"
+        explanation += "💡 개선된 AI 분석 방식:\n"
+        explanation += "1. 문장 단위 분석: 전체 텍스트를 개별 문장으로 분할\n"
+        explanation += "2. 세밀한 검토: 각 문장을 독립적으로 Zero-shot Classification 수행\n"
+        explanation += "3. 엄격한 기준: 80% 이상 신뢰도만 '위험', 65% 이상만 '경고' 등급 부여\n"
+        explanation += "4. 결과 종합: 모든 문장의 분석 결과를 종합하여 최종 판단\n"
+        explanation += "5. 신뢰도 계산: 위험한 문장들의 신뢰도 평균값으로 최종 신뢰도 산정\n\n"
+        
+        explanation += "✅ 주요 개선사항:\n"
+        explanation += "• 문장 단위 검토: 미묘한 차별 표현도 정확히 감지\n"
+        explanation += "• 엄격한 판정 기준: 거짓 경보 방지, 정확도 향상\n"
+        explanation += "• 신뢰도 투명성: 각 위험 문장의 신뢰도 점수 공개\n"
+        explanation += "• 순위 정렬: 가장 위험한 문장부터 우선 표시\n\n"
+        
+        explanation += "⚠️ 주의사항:\n"
+        explanation += "• 본 프로그램은 보조적 목적으로 사용되어야 합니다.\n"
+        explanation += "• 최종 판단은 인간의 검토가 필요합니다.\n"
+        explanation += "• AI 모델도 완벽하지 않으므로 오류가 발생할 수 있습니다.\n"
+        explanation += "• 피드백을 통해 지속적으로 개선됩니다.\n"
+        explanation += "=" * 100 + "\n"
+        
+        return explanation
+    
+    def submit_feedback(self):
+        """피드백 제출"""
+        feedback_content = self.feedback_text.get("1.0", tk.END).strip()
+        
+        if not feedback_content:
+            messagebox.showwarning("경고", "피드백 내용을 입력해주세요.")
+            return
+        
+        if not self.analysis_result:
+            messagebox.showwarning("경고", "분석 결과가 없습니다.")
+            return
+        
+        # 피드백 저장
+        feedback_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "text": self.current_text,
+            "analysis_result": self.analysis_result,
+            "feedback": feedback_content
+        }
+        
+        self.feedback_data.append(feedback_entry)
+        self.save_feedback_data()
+        
+        self.feedback_text.delete("1.0", tk.END)
+        messagebox.showinfo("성공", "피드백이 제출되었습니다.\n프로그램 개선에 사용되겠습니다.")
+    
+    def save_feedback_data(self):
+        """피드백 데이터 저장"""
+        try:
+            with open(self.feedback_file, 'w', encoding='utf-8') as f:
+                json.dump(self.feedback_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            messagebox.showerror("오류", f"피드백 저장 중 오류: {str(e)}")
+    
+    def load_feedback_data(self):
+        """피드백 데이터 로드"""
+        try:
+            if os.path.exists(self.feedback_file):
+                with open(self.feedback_file, 'r', encoding='utf-8') as f:
+                    self.feedback_data = json.load(f)
+        except Exception as e:
+            print(f"피드백 로드 중 오류: {str(e)}")
+            self.feedback_data = []
+    
+    def view_feedback_history(self):
+        """피드백 기록 보기"""
+        if not self.feedback_data:
+            messagebox.showinfo("알림", "저장된 피드백이 없습니다.")
+            return
+        
+        # 새 윈도우 생성
+        history_window = tk.Toplevel(self.root)
+        history_window.title("피드백 기록")
+        history_window.geometry("800x600")
+        history_window.configure(bg="#f5f5f5")
+        
+        # 제목
+        title = ttk.Label(history_window, text=f"📝 피드백 기록 ({len(self.feedback_data)}개)", 
+                         font=("Arial", 12, "bold"))
+        title.pack(pady=10)
+        
+        # 스크롤 텍스트 영역
+        text_frame = ttk.Frame(history_window)
+        text_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        history_text = scrolledtext.ScrolledText(text_frame, height=20, width=90, 
+                                                wrap=tk.WORD, font=("Arial", 9))
+        history_text.pack(fill="both", expand=True)
+        
+        # 피드백 기록 표시
+        for i, feedback in enumerate(self.feedback_data, 1):
+            history_text.insert(tk.END, f"\n{'='*80}\n")
+            history_text.insert(tk.END, f"피드백 #{i}\n")
+            history_text.insert(tk.END, f"시간: {feedback['timestamp']}\n")
+            history_text.insert(tk.END, f"원문: {feedback['text'][:100]}...\n")
+            history_text.insert(tk.END, f"피드백: {feedback['feedback']}\n")
+        
+        history_text.config(state="disabled")
+        
+        # 닫기 버튼
+        close_btn = ttk.Button(history_window, text="닫기", command=history_window.destroy)
+        close_btn.pack(pady=10)
+    
+    def clear_text(self):
+        """텍스트 초기화"""
+        self.text_input.delete("1.0", tk.END)
+        self.feedback_text.delete("1.0", tk.END)
+        self.analysis_result = None
+        self.current_text = ""
+        
+        for key in self.category_keys:
+            self.result_labels[key]["risk"].config(text="검사 대기 중", foreground="gray")
+            self.result_labels[key]["confidence"].config(text="")
+        
+        self.process_btn.config(state="disabled")
+        self.feedback_submit_btn.config(state="disabled")
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = AIRiskFilterAdvanced(root)
+    root.mainloop()
